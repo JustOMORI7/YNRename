@@ -1049,7 +1049,6 @@ class YNRename(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     icon_path = "ynrename.ico"
-    if not os.path.exists(icon_path): open(icon_path, 'a').close()
     app.setWindowIcon(QIcon(icon_path))
     window = YNRename()
     window.show()
