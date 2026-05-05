@@ -162,6 +162,10 @@ class RenameLogic:
     @staticmethod
     def apply_additions(name, is_suffix, sep, text, do_date, do_time, do_num, num_idx, start, step, digits):
         base, ext = os.path.splitext(name)
+        # If base is like ".mp3" and ext is empty, the original base was fully trimmed away.
+        # os.path.splitext treats ".mp3" as a hidden file (base=".mp3", ext="") — fix this.
+        if ext == '' and base.startswith('.'):
+            base, ext = '', base
         parts = []
         if text: parts.append(text)
         if do_date:
@@ -173,18 +177,14 @@ class RenameLogic:
         if do_num:
             num = start + (num_idx * step)
             parts.append(str(num).zfill(digits))
-            
+
         if not parts: return name
-        
+
         addon = sep.join(parts)
-        
-        res = base
-        if addon:
-            if is_suffix:
-                res = f"{base}{sep}{addon}" if base else addon
-            else:
-                res = f"{addon}{sep}{base}" if base else addon
-                
+        if is_suffix:
+            res = f"{base}{sep}{addon}" if base else addon
+        else:
+            res = f"{addon}{sep}{base}" if base else addon
         return res + ext
 
     @staticmethod
@@ -201,8 +201,8 @@ class RenameLogic:
             
         if trim_start > 0:
             base = base[trim_start:]
-        if trim_end > 0 and len(base) > trim_end:
-            base = base[:-trim_end]
+        if trim_end > 0:
+            base = base[:-trim_end] if trim_end < len(base) else ""
         if trim_b1 and trim_b2:
             pat = re.escape(trim_b1) + r'.*?' + re.escape(trim_b2)
             base = re.sub(pat, "", base)
@@ -348,6 +348,26 @@ class UndoThread(QThread):
         self.finished.emit(results)
 
 
+# ── Custom Table (reliable row reorder) ─────────────────────────────────
+
+class ReorderTable(QTableWidget):
+    rowMoved = pyqtSignal(int, int)
+
+    def dropEvent(self, event):
+        if event.source() is self:
+            event.setDropAction(Qt.IgnoreAction)
+            event.accept()
+            sel_rows = sorted(list(set(item.row() for item in self.selectedItems())))
+            if not sel_rows: return
+            src_row = sel_rows[0]
+            dst_row = self.rowAt(event.pos().y())
+            if dst_row == -1: dst_row = self.rowCount() - 1
+            if src_row != dst_row:
+                self.rowMoved.emit(src_row, dst_row)
+        else:
+            super().dropEvent(event)
+
+
 # ── UI Elements ───────────────────────────────────────────────────────────────
 
 class YNRename(QMainWindow):
@@ -430,7 +450,7 @@ class YNRename(QMainWindow):
         main_split = QHBoxLayout()
         
         # Left: Table
-        self.table = QTableWidget(0, 3)
+        self.table = ReorderTable(0, 3)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -442,7 +462,7 @@ class YNRename(QMainWindow):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.table.itemChanged.connect(self._on_table_item_changed)
-        self.table.model().rowsMoved.connect(self._on_rows_moved)
+        self.table.rowMoved.connect(self._on_row_moved)
         
         # Right: Tabs
         self.tabs = QTabWidget()
@@ -724,6 +744,17 @@ class YNRename(QMainWindow):
         paths = [url.toLocalFile() for url in event.mimeData().urls()]
         self._process_dropped_paths(paths)
 
+    def _on_table_item_changed(self, item):
+        if item.column() == 0:
+            row = item.row()
+            if row < len(self.files):
+                self.files[row]['checked'] = (item.checkState() == Qt.Checked)
+
+    def _on_row_moved(self, src, dst):
+        item = self.files.pop(src)
+        self.files.insert(dst, item)
+        self._queue_preview()
+
     def _process_dropped_paths(self, paths):
         for p in paths:
             if os.path.isfile(p):
@@ -746,7 +777,7 @@ class YNRename(QMainWindow):
     def _add_file_to_list(self, path):
         if any(f['path'] == path for f in self.files): return
         name = os.path.basename(path)
-        self.files.append({'path': path, 'old_name': name, 'new_name': name})
+        self.files.append({'path': path, 'old_name': name, 'new_name': name, 'checked': True})
 
     def _remove_checked(self):
         self.files = [f for f in self.files if not f.get('checked', False)]
@@ -769,13 +800,6 @@ class YNRename(QMainWindow):
         self.table.setRowCount(0)
         self.lbl_status.setText(self._t("status_ready", count=0))
 
-    def _on_rows_moved(self, parent, start, end, destination, row):
-        moved = self.files[start:end+1]
-        del self.files[start:end+1]
-        insert_idx = row if row < start else row - (end - start + 1)
-        for i, item in enumerate(moved):
-            self.files.insert(insert_idx + i, item)
-        self._queue_preview()
 
     def _queue_preview(self):
         self.preview_timer.start(150)
@@ -790,11 +814,6 @@ class YNRename(QMainWindow):
         act_remove.triggered.connect(self._remove_highlighted)
         menu.exec_(self.table.viewport().mapToGlobal(pos))
 
-    def _on_table_item_changed(self, item):
-        if item.column() == 0:
-            row = item.row()
-            if row < len(self.files):
-                self.files[row]['checked'] = (item.checkState() == Qt.Checked)
 
     def _do_preview(self):
         self.table.blockSignals(True)
@@ -837,10 +856,14 @@ class YNRename(QMainWindow):
             name = f['old_name']
             name = RenameLogic.apply_find_replace(name, find, repl, case_sen, use_regex)
             if case_mode: name = RenameLogic.apply_case(name, case_mode)
-            name = RenameLogic.apply_additions(name, is_suffix, add_sep, add_text, do_date, do_time, do_num, i, start, step, digits)
             name = RenameLogic.apply_clean(name, cln_tr, cln_sp, cln_os, t_start, t_end, t_b1, t_b2)
+            name = RenameLogic.apply_additions(name, is_suffix, add_sep, add_text, do_date, do_time, do_num, i, start, step, digits)
             if m_format: name = RenameLogic.apply_metadata(f['path'], name, m_format, f['old_name'])
             name = RenameLogic.apply_regex(name, rx_pat, rx_rep)
+            
+            # Force remove invalid Windows filename characters
+            if platform.system() == "Windows":
+                name = re.sub(r'[\\/*?:"<>|]', "", name)
             
             f['new_name'] = name
             item_old = QTableWidgetItem(f['old_name'])
@@ -886,10 +909,11 @@ class YNRename(QMainWindow):
         self.progress.show()
         self.progress.setValue(0)
         self.lbl_status.setText(self._t("status_renaming"))
+        self._rename_errors = []
         self.thread = RenameThread(rename_map)
         self.thread.progress.connect(self.progress.setValue)
         self.thread.finished.connect(self._on_rename_finished)
-        self.thread.error.connect(lambda e: self.lbl_status.setText(self._t("status_error", msg=e)))
+        self.thread.error.connect(lambda e: self._rename_errors.append(e))
         self.thread.start()
 
     def _on_rename_finished(self, results):
@@ -898,6 +922,9 @@ class YNRename(QMainWindow):
         self.history = results
         self.btn_undo.setEnabled(len(self.history) > 0)
         self._clear_list()
+        if hasattr(self, '_rename_errors') and self._rename_errors:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Hata", "Bazı dosyalar yeniden adlandırılamadı:\n" + "\n".join(self._rename_errors[:5]))
         self.lbl_status.setText(self._t("status_done", count=len(results)))
 
     def _undo_rename(self):
